@@ -41,11 +41,11 @@ def load_gaps(csv_path):
 def plot_csv(csv_path, plots_dir):
     times, primary_gaps, secondary_gaps = load_gaps(csv_path)
     figure, axis = plt.subplots(figsize=(11, 6), layout="constrained")
-    axis.plot(times, primary_gaps, label="Primary gap", linewidth=1.2)
-    axis.plot(times, secondary_gaps, label="Secondary gap", linewidth=1.2)
-    axis.set_title(f"Sheave Gaps: {csv_path.stem}")
-    axis.set_xlabel("Time (seconds at 60 fps)")
-    axis.set_ylabel("Gap (inches)")
+    axis.plot(times, primary_gaps, label="Primary", linewidth=1.2)
+    axis.plot(times, secondary_gaps, label="Secondary", linewidth=1.2)
+    axis.set_title(f"Sheave Travel for: {csv_path.stem}")
+    axis.set_xlabel("Time (seconds)")
+    axis.set_ylabel("Sheave Travel (inches)")
     axis.grid(True, alpha=0.3)
     axis.legend()
 

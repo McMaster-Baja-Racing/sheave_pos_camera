@@ -1,4 +1,5 @@
 import csv
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -25,11 +26,16 @@ class CVTSheaveTracker:
         self.cap = cv2.VideoCapture(self.video_path)
         if not self.cap.isOpened():
             raise ValueError(f"Could not open video file: {self.video_path}")
+        orientation_property = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+        if orientation_property is not None:
+            self.cap.set(orientation_property, 1)
 
         screen_w = 1920
         screen_h = 1080
-        self.win_w = min(1200, int(screen_w * 0.6))
-        self.win_h = min(800, int(screen_h * 0.6))
+        self.max_win_w = min(1200, int(screen_w * 0.6))
+        self.max_win_h = min(800, int(screen_h * 0.6))
+        self.win_w = self.max_win_w
+        self.win_h = self.max_win_h
         
         # Track line-selection and optical-flow state.
         self.drawing = False
@@ -67,6 +73,18 @@ class CVTSheaveTracker:
     def apply_clahe(self, gray_frame):
         """Normalizes dynamic lighting fluctuations and specular highlights."""
         return self.clahe.apply(gray_frame)
+
+    def resize_frame(self, frame):
+        frame_h, frame_w = frame.shape[:2]
+        scale = min(
+            self.max_win_w / frame_w,
+            self.max_win_h / frame_h,
+            1.0,
+        )
+        self.win_w = max(1, int(round(frame_w * scale)))
+        self.win_h = max(1, int(round(frame_h * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        return cv2.resize(frame, (self.win_w, self.win_h), interpolation=interpolation)
 
     @staticmethod
     def is_window_open(window_name):
@@ -180,6 +198,7 @@ class CVTSheaveTracker:
     def track_line(self, gray, key):
         """Track features but move the selected line only perpendicular to itself."""
         points = self.line_points[key]
+        preserve_direction = key in ('belt_edge_first', 'belt_edge_second')
         if self.previous_gray is not None and len(points) > 0:
             next_points, status, errors = cv2.calcOpticalFlowPyrLK(
                 self.previous_gray,
@@ -240,6 +259,7 @@ class CVTSheaveTracker:
                                     gray,
                                     updated_line,
                                     max_offset=4,
+                                    preserve_direction=preserve_direction,
                                 )
                                 line_inliers = self.points_near_line(
                                     new_valid,
@@ -256,13 +276,14 @@ class CVTSheaveTracker:
             gray,
             self.line_endpoints[key],
             max_offset=6,
+            preserve_direction=preserve_direction,
         )
         self.line_endpoints[key] = line
         self.initialize_line_points(gray, key)
         return self.line_endpoints[key]
 
     @staticmethod
-    def snap_line_to_edge(gray, line, max_offset=6):
+    def snap_line_to_edge(gray, line, max_offset=6, preserve_direction=False):
         endpoints = np.asarray(line, dtype=np.float32)
         direction = endpoints[1] - endpoints[0]
         length = np.linalg.norm(direction)
@@ -299,6 +320,11 @@ class CVTSheaveTracker:
         valid = best_strengths >= threshold
         if np.count_nonzero(valid) < 3:
             return line
+
+        if preserve_direction:
+            median_offset = float(np.median(offsets[best_indices[valid]]))
+            snapped = endpoints + normal * median_offset
+            return tuple(tuple(np.round(point).astype(int)) for point in snapped)
 
         edge_points = samples[valid] + normal * offsets[best_indices[valid], None]
         vx, vy, center_x, center_y = cv2.fitLine(
@@ -409,13 +435,24 @@ class CVTSheaveTracker:
         print(f"Results exported to {output_path}")
         return output_path
 
+    @staticmethod
+    def run_plot_script():
+        plot_script = Path(__file__).resolve().parent.parent / "results" / "plot_travel.py"
+        try:
+            result = subprocess.run([sys.executable, str(plot_script)], check=False)
+        except OSError as error:
+            print(f"Warning: could not run plot_travel.py: {error}")
+            return
+        if result.returncode != 0:
+            print(f"Warning: plot_travel.py exited with code {result.returncode}.")
+
     def run(self):
         ret, first_frame = self.cap.read()
         if not ret:
             print("Error reading video source.")
             return
 
-        first_frame = cv2.resize(first_frame, (self.win_w, self.win_h))
+        first_frame = self.resize_frame(first_frame)
         
         drawn_targets = [
             (f"Primary first boundary (start gap {PRIMARY_MAX_GAP_IN:.3f} in)", 'primary_first', (0, 0, 255)),
@@ -497,22 +534,47 @@ class CVTSheaveTracker:
             if not ret:
                 break
 
-            frame = cv2.resize(frame, (self.win_w, self.win_h))
+            frame = self.resize_frame(frame)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray_eq = self.apply_clahe(gray)
+            portrait_layout = self.win_h > self.win_w
 
-            # Overlay bar (Matches window mockup)
+            if portrait_layout:
+                overlay_height = 80
+                status_box = (10, 8, self.win_w - 10, 36)
+                status_position = (20, 28)
+                measurement_box = (10, 44, self.win_w - 10, 72)
+                measurement_position = (20, 64)
+            else:
+                overlay_height = 45
+                status_box = (10, 8, 340, 37)
+                status_position = (20, 28)
+                measurement_box = (self.win_w - 360, 8, self.win_w - 10, 37)
+                measurement_position = (self.win_w - 350, 28)
+
             overlay = frame.copy()
-            cv2.rectangle(overlay, (0, 0), (self.win_w, 45), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (0, 0), (self.win_w, overlay_height), (0, 0, 0), -1)
             frame = cv2.addWeighted(overlay, 0.75, frame, 0.25, 0)
 
-            # Red instruction box
-            cv2.rectangle(frame, (10, 8), (340, 37), (0, 0, 255), 2)
-            cv2.putText(frame, "STATUS: Tracking Selected Sheaves", (20, 28), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
-
-            # Blue measurement box
-            cv2.rectangle(frame, (self.win_w - 360, 8), (self.win_w - 10, 37), (255, 0, 0), 2)
+            status_text = "STATUS: Tracking Selected Sheaves"
+            status_font_scale = 0.50
+            status_width = cv2.getTextSize(
+                status_text, cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, 1
+            )[0][0]
+            status_available_width = status_box[2] - status_position[0] - 8
+            if status_width > status_available_width:
+                status_font_scale *= status_available_width / status_width
+            cv2.rectangle(frame, status_box[:2], status_box[2:], (0, 0, 255), 2)
+            cv2.putText(
+                frame,
+                status_text,
+                status_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                status_font_scale,
+                (255, 255, 255),
+                1,
+            )
+            cv2.rectangle(frame, measurement_box[:2], measurement_box[2:], (255, 0, 0), 2)
 
             tracked_lines = {
                 key: self.track_line(gray_eq, key)
@@ -554,10 +616,25 @@ class CVTSheaveTracker:
             ))
             frame_index += 1
 
-            # Display real-time measurement readings in top-right blue box
             meas_text = f"Primary: {prim_gap_in:.3f} in | Sec: {sec_gap_in:.3f} in"
-            cv2.putText(frame, meas_text, (self.win_w - 350, 28), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            measurement_font_scale = 0.50
+            measurement_width = cv2.getTextSize(
+                meas_text, cv2.FONT_HERSHEY_SIMPLEX, measurement_font_scale, 1
+            )[0][0]
+            measurement_available_width = (
+                measurement_box[2] - measurement_position[0] - 8
+            )
+            if measurement_width > measurement_available_width:
+                measurement_font_scale *= measurement_available_width / measurement_width
+            cv2.putText(
+                frame,
+                meas_text,
+                measurement_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                measurement_font_scale,
+                (255, 255, 255),
+                1,
+            )
 
             # Show the currently tracked boundaries.
             for key, color in (
@@ -591,6 +668,7 @@ class CVTSheaveTracker:
         self.cap.release()
         cv2.destroyAllWindows()
         self.export_results(measurements)
+        self.run_plot_script()
 
 if __name__ == '__main__':
     video_path = sys.argv[1] if len(sys.argv) > 1 else None
