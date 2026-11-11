@@ -11,6 +11,8 @@ BELT_WIDTH_IN = 0.905
 PRIMARY_MIN_GAP_IN = BELT_WIDTH_IN
 PRIMARY_MAX_GAP_IN = 1.7
 SECONDARY_MIN_GAP_IN = BELT_WIDTH_IN
+MAX_LINE_ANGLE_CHANGE_DEG = 10
+SHEAVE_SEARCH_RADIUS_PX = 50
 
 
 class CVTSheaveTracker:
@@ -42,6 +44,9 @@ class CVTSheaveTracker:
         self.line_start = None
         self.current_line = None
         self.line_endpoints = {}
+        self.line_reference_endpoints = {}
+        self.line_reference_angles = {}
+        self.line_reference_polarities = {}
         self.line_points = {}
         self.previous_gray = None
 
@@ -195,11 +200,46 @@ class CVTSheaveTracker:
         else:
             self.line_points[key] = points.astype(np.float32)
 
+    def select_tracking_lines(self, frame, gray, drawn_targets, is_correction=False):
+        for label, key, color in drawn_targets:
+            if is_correction:
+                label = f"Correct {label}"
+            line = self.draw_sheave_selection(label, frame, color)
+            if line is None:
+                return False
+            start, end = line
+            if start[0] > end[0]:
+                line = (end, start)
+            self.line_endpoints[key] = line
+            self.line_reference_endpoints[key] = line
+            direction = np.asarray(line[1], dtype=np.float32) - line[0]
+            self.line_reference_angles[key] = float(
+                np.arctan2(direction[1], direction[0])
+            )
+            self.line_reference_polarities[key] = self.measure_line_polarity(
+                gray,
+                line,
+            )
+            self.initialize_line_points(gray, key)
+
+        belt_angles = np.array([
+            self.line_reference_angles['belt_edge_first'],
+            self.line_reference_angles['belt_edge_second'],
+        ])
+        belt_angle = 0.5 * np.arctan2(
+            np.sin(2 * belt_angles).mean(),
+            np.cos(2 * belt_angles).mean(),
+        )
+        self.line_reference_angles['belt_edge_first'] = float(belt_angle)
+        self.line_reference_angles['belt_edge_second'] = float(belt_angle)
+        self.previous_gray = gray
+        return True
+
     def track_line(self, gray, key):
         """Track features but move the selected line only perpendicular to itself."""
         points = self.line_points[key]
         preserve_direction = key in ('belt_edge_first', 'belt_edge_second')
-        if self.previous_gray is not None and len(points) > 0:
+        if preserve_direction and self.previous_gray is not None and len(points) > 0:
             next_points, status, errors = cv2.calcOpticalFlowPyrLK(
                 self.previous_gray,
                 gray,
@@ -260,6 +300,13 @@ class CVTSheaveTracker:
                                     updated_line,
                                     max_offset=4,
                                     preserve_direction=preserve_direction,
+                                    preferred_polarity=self.line_reference_polarities.get(
+                                        key, 0
+                                    ),
+                                )
+                                updated_line = self.constrain_line_angle(
+                                    updated_line,
+                                    self.line_reference_angles[key],
                                 )
                                 line_inliers = self.points_near_line(
                                     new_valid,
@@ -272,18 +319,112 @@ class CVTSheaveTracker:
                                     self.line_points[key] = new_valid.reshape(-1, 1, 2)
                                     return self.line_endpoints[key]
 
+        if preserve_direction:
+            reference_line = self.line_endpoints[key]
+            max_offset = 6
+        else:
+            reference_line = self.line_reference_endpoints[key]
+            max_offset = SHEAVE_SEARCH_RADIUS_PX
         line = self.snap_line_to_edge(
             gray,
-            self.line_endpoints[key],
-            max_offset=6,
+            reference_line,
+            max_offset=max_offset,
             preserve_direction=preserve_direction,
+            preferred_polarity=self.line_reference_polarities.get(key, 0),
         )
+        line = self.constrain_line_angle(line, self.line_reference_angles[key])
         self.line_endpoints[key] = line
         self.initialize_line_points(gray, key)
         return self.line_endpoints[key]
 
     @staticmethod
-    def snap_line_to_edge(gray, line, max_offset=6, preserve_direction=False):
+    def constrain_line_angle(
+        line,
+        reference_angle,
+        max_change_degrees=MAX_LINE_ANGLE_CHANGE_DEG,
+    ):
+        endpoints = np.asarray(line, dtype=np.float32)
+        direction = endpoints[1] - endpoints[0]
+        length = float(np.linalg.norm(direction))
+        if length < 1:
+            return line
+
+        angle = float(np.arctan2(direction[1], direction[0]))
+        angle_difference = (angle - reference_angle + np.pi / 2) % np.pi - np.pi / 2
+        max_change = np.deg2rad(max_change_degrees)
+        angle_adjustment = np.clip(angle_difference, -max_change, max_change)
+        midpoint = endpoints.mean(axis=0)
+        while True:
+            constrained_angle = reference_angle + angle_adjustment
+            constrained_direction = np.array(
+                [np.cos(constrained_angle), np.sin(constrained_angle)],
+                dtype=np.float32,
+            )
+            half_vector = constrained_direction * (length / 2)
+            constrained = np.array([midpoint - half_vector, midpoint + half_vector])
+            result = tuple(tuple(np.round(point).astype(int)) for point in constrained)
+            result_direction = np.asarray(result[1]) - result[0]
+            result_angle = np.arctan2(result_direction[1], result_direction[0])
+            result_difference = (
+                (result_angle - reference_angle + np.pi / 2) % np.pi - np.pi / 2
+            )
+            if abs(result_difference) <= max_change or abs(angle_adjustment) < 1e-8:
+                return result
+            angle_adjustment -= np.sign(angle_adjustment) * min(
+                np.deg2rad(0.1), abs(angle_adjustment)
+            )
+
+    @staticmethod
+    def measure_line_polarity(gray, line, max_offset=3):
+        endpoints = np.asarray(line, dtype=np.float32)
+        direction = endpoints[1] - endpoints[0]
+        length = float(np.linalg.norm(direction))
+        if length < 1:
+            return 0
+
+        direction /= length
+        normal = np.array([-direction[1], direction[0]])
+        sample_count = min(100, max(12, int(length / 4)))
+        sample_positions = np.linspace(0.1, 0.9, sample_count)
+        samples = endpoints[0] + sample_positions[:, None] * (endpoints[1] - endpoints[0])
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        gradient_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
+        offsets = np.arange(-max_offset, max_offset + 1)
+        locations = np.rint(
+            samples[:, None, :] + normal[None, None, :] * offsets[None, :, None]
+        ).astype(int)
+        inside = (
+            (locations[:, :, 0] >= 0)
+            & (locations[:, :, 0] < gray.shape[1])
+            & (locations[:, :, 1] >= 0)
+            & (locations[:, :, 1] < gray.shape[0])
+        )
+        x = np.clip(locations[:, :, 0], 0, gray.shape[1] - 1)
+        y = np.clip(locations[:, :, 1], 0, gray.shape[0] - 1)
+        signed_strength = gradient_x[y, x] * normal[0] + gradient_y[y, x] * normal[1]
+        signed_strength[~inside] = 0
+        best_indices = np.argmax(np.abs(signed_strength), axis=1)
+        best_strengths = signed_strength[np.arange(sample_count), best_indices]
+        reliable = np.abs(best_strengths) >= 10.0
+        if np.count_nonzero(reliable) < 3:
+            return 0
+
+        positive_fraction = float(np.mean(best_strengths[reliable] > 0))
+        if positive_fraction >= 0.65:
+            return 1
+        if positive_fraction <= 0.35:
+            return -1
+        return 0
+
+    @staticmethod
+    def snap_line_to_edge(
+        gray,
+        line,
+        max_offset=6,
+        preserve_direction=False,
+        preferred_polarity=0,
+    ):
         endpoints = np.asarray(line, dtype=np.float32)
         direction = endpoints[1] - endpoints[0]
         length = np.linalg.norm(direction)
@@ -295,8 +436,9 @@ class CVTSheaveTracker:
         sample_count = min(100, max(12, int(length / 4)))
         sample_positions = np.linspace(0.1, 0.9, sample_count)
         samples = endpoints[0] + sample_positions[:, None] * (endpoints[1] - endpoints[0])
-        gradient_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gradient_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        gradient_x = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3)
 
         offsets = np.arange(-max_offset, max_offset + 1)
         locations = np.rint(
@@ -310,8 +452,11 @@ class CVTSheaveTracker:
         )
         x = np.clip(locations[:, :, 0], 0, gray.shape[1] - 1)
         y = np.clip(locations[:, :, 1], 0, gray.shape[0] - 1)
-        edge_strength = np.abs(
-            gradient_x[y, x] * normal[0] + gradient_y[y, x] * normal[1]
+        signed_strength = gradient_x[y, x] * normal[0] + gradient_y[y, x] * normal[1]
+        edge_strength = (
+            np.maximum(signed_strength * preferred_polarity, 0)
+            if preferred_polarity
+            else np.abs(signed_strength)
         )
         edge_strength[~inside] = 0
         best_indices = np.argmax(edge_strength, axis=1)
@@ -455,28 +600,20 @@ class CVTSheaveTracker:
         first_frame = self.resize_frame(first_frame)
         
         drawn_targets = [
-            (f"Primary first boundary (start gap {PRIMARY_MAX_GAP_IN:.3f} in)", 'primary_first', (0, 0, 255)),
-            ("Primary second boundary", 'primary_second', (0, 0, 255)),
-            (f"Secondary first boundary (start gap {SECONDARY_MIN_GAP_IN:.3f} in)", 'secondary_first', (255, 0, 0)),
-            ("Secondary second boundary", 'secondary_second', (255, 0, 0)),
+            (f"Primary first sheave edge, away from belt (start {PRIMARY_MAX_GAP_IN:.3f} in)", 'primary_first', (0, 0, 255)),
+            ("Primary second sheave edge, away from belt", 'primary_second', (0, 0, 255)),
+            (f"Secondary first inner sheave edge, toward belt (start {SECONDARY_MIN_GAP_IN:.3f} in)", 'secondary_first', (255, 0, 0)),
+            ("Secondary second inner sheave edge, toward belt", 'secondary_second', (255, 0, 0)),
             ("Belt edge 1 (draw along one side of a belt section)", 'belt_edge_first', (0, 255, 0)),
             ("Belt edge 2 (parallel, along the opposite side)", 'belt_edge_second', (0, 255, 0)),
         ]
 
         # Draw the sheave boundaries and belt edges used for local calibration.
         gray_first = self.apply_clahe(cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY))
-        for label, key, color in drawn_targets:
-            line = self.draw_sheave_selection(label, first_frame, color)
-            if line is None:
-                self.cap.release()
-                cv2.destroyAllWindows()
-                return
-            start, end = line
-            if start[0] > end[0]:
-                line = (end, start)
-            self.line_endpoints[key] = line
-            self.initialize_line_points(gray_first, key)
-
+        if not self.select_tracking_lines(first_frame, gray_first, drawn_targets):
+            self.cap.release()
+            cv2.destroyAllWindows()
+            return
         self.secondary_start_gap_px = self.line_gap(
             self.line_endpoints['secondary_first'],
             self.line_endpoints['secondary_second'],
@@ -519,8 +656,6 @@ class CVTSheaveTracker:
         self.secondary_scale_factor = (
             self.belt_scale_factor * self.secondary_local_scale_correction
         )
-        self.previous_gray = gray_first
-
         # Step 2: Main measurement loop
         win_name = "CVT Sheave Measurement"
         cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
@@ -537,6 +672,7 @@ class CVTSheaveTracker:
             frame = self.resize_frame(frame)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray_eq = self.apply_clahe(gray)
+            selection_frame = frame
             portrait_layout = self.win_h > self.win_w
 
             if portrait_layout:
@@ -556,7 +692,14 @@ class CVTSheaveTracker:
             cv2.rectangle(overlay, (0, 0), (self.win_w, overlay_height), (0, 0, 0), -1)
             frame = cv2.addWeighted(overlay, 0.75, frame, 0.25, 0)
 
-            status_text = "STATUS: Tracking Selected Sheaves"
+            elapsed_fps = fps if fps > 0 else 30.0
+            elapsed_seconds = int(frame_index / elapsed_fps)
+            elapsed_hours, remainder = divmod(elapsed_seconds, 3600)
+            elapsed_minutes, elapsed_seconds = divmod(remainder, 60)
+            elapsed_text = (
+                f"{elapsed_hours:02d}:{elapsed_minutes:02d}:{elapsed_seconds:02d}"
+            )
+            status_text = f"SPACE: Redraw lines | Elapsed: {elapsed_text}"
             status_font_scale = 0.50
             status_width = cv2.getTextSize(
                 status_text, cv2.FONT_HERSHEY_SIMPLEX, status_font_scale, 1
@@ -597,7 +740,13 @@ class CVTSheaveTracker:
                     min_gap=SECONDARY_MIN_GAP_IN / self.secondary_scale_factor,
                 )
             )
-
+            for key in (
+                'primary_first',
+                'primary_second',
+                'secondary_first',
+                'secondary_second',
+            ):
+                self.line_endpoints[key] = tracked_lines[key]
             prim_gap_px = self.line_gap(
                 tracked_lines['primary_first'], tracked_lines['primary_second']
             )
@@ -662,6 +811,16 @@ class CVTSheaveTracker:
             key = cv2.waitKey(30) & 0xFF
             if key in (ord('q'), 27):
                 break
+            if key == 32:
+                cv2.destroyWindow(win_name)
+                if not self.select_tracking_lines(
+                    selection_frame,
+                    gray_eq,
+                    drawn_targets,
+                    is_correction=True,
+                ):
+                    break
+                cv2.namedWindow(win_name, cv2.WINDOW_AUTOSIZE)
             if not self.is_window_open(win_name):
                 break
 
